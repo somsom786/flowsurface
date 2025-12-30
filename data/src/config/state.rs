@@ -25,6 +25,8 @@ pub struct State {
     pub audio_cfg: AudioStream,
     pub trade_fetch_enabled: bool,
     pub size_in_quote_ccy: exchange::SizeUnit,
+    /// Tree of Alpha API key for news integration
+    pub tree_of_alpha_api_key: Option<String>,
 }
 
 impl State {
@@ -38,6 +40,7 @@ impl State {
         scale_factor: ScaleFactor,
         audio_cfg: AudioStream,
         volume_size_unit: exchange::SizeUnit,
+        tree_of_alpha_api_key: Option<String>,
     ) -> Self {
         State {
             layout_manager,
@@ -50,6 +53,7 @@ impl State {
             audio_cfg,
             trade_fetch_enabled: exchange::fetcher::is_trade_fetch_enabled(),
             size_in_quote_ccy: volume_size_unit,
+            tree_of_alpha_api_key,
         }
     }
 }

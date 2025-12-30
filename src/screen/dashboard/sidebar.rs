@@ -189,10 +189,23 @@ impl Sidebar {
             )
         };
 
+        let news_btn = {
+            let is_active = self.is_menu_active(sidebar::Menu::News);
+
+            button_with_tooltip(
+                icon_text(Icon::ExternalLink, 14).width(24).align_x(Alignment::Center),
+                Message::ToggleSidebarMenu(Some(sidebar::Menu::News)),
+                Some("News"),
+                tooltip_position,
+                move |theme, status| crate::style::button::transparent(theme, status, is_active),
+            )
+        };
+
         column![
             ticker_search_button,
             layout_modal_button,
             audio_btn,
+            news_btn,
             space::vertical(),
             settings_modal_button,
         ]

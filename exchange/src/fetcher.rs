@@ -30,6 +30,10 @@ pub enum FetchedData {
         data: Vec<OpenInterest>,
         req_id: Option<uuid::Uuid>,
     },
+    News {
+        data: Vec<crate::adapter::treeofalpha::NewsItem>,
+        req_id: Option<uuid::Uuid>,
+    },
 }
 
 #[derive(thiserror::Error, Debug, Clone)]
@@ -119,6 +123,7 @@ pub enum FetchRange {
     Kline(u64, u64),
     OpenInterest(u64, u64),
     Trades(u64, u64),
+    News,
 }
 
 #[derive(PartialEq, Debug)]
@@ -141,6 +146,7 @@ impl FetchRequest {
             (FetchRange::OpenInterest(s1, e1), FetchRange::OpenInterest(s2, e2)) => {
                 e1 == e2 && s1 == s2
             }
+            (FetchRange::News, FetchRange::News) => true,
             _ => false,
         }
     }
@@ -189,4 +195,5 @@ pub enum InfoKind {
     FetchingKlines,
     FetchingTrades(usize),
     FetchingOI,
+    FetchingNews,
 }

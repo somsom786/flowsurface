@@ -27,6 +27,10 @@ pub enum Pane {
         a: Box<Pane>,
         b: Box<Pane>,
     },
+    News {
+        #[serde(deserialize_with = "ok_or_default", default)]
+        link_group: Option<LinkGroup>,
+    },
     Starter {
         #[serde(deserialize_with = "ok_or_default", default)]
         link_group: Option<LinkGroup>,
@@ -185,6 +189,7 @@ impl VisualConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContentKind {
     Starter,
+    News,
     HeatmapChart,
     FootprintChart,
     CandlestickChart,
@@ -194,8 +199,9 @@ pub enum ContentKind {
 }
 
 impl ContentKind {
-    pub const ALL: [ContentKind; 7] = [
+    pub const ALL: [ContentKind; 8] = [
         ContentKind::Starter,
+        ContentKind::News,
         ContentKind::HeatmapChart,
         ContentKind::FootprintChart,
         ContentKind::CandlestickChart,
@@ -209,6 +215,7 @@ impl std::fmt::Display for ContentKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             ContentKind::Starter => "Starter Pane",
+            ContentKind::News => "News",
             ContentKind::HeatmapChart => "Heatmap Chart",
             ContentKind::FootprintChart => "Footprint Chart",
             ContentKind::CandlestickChart => "Candlestick Chart",
@@ -262,7 +269,7 @@ impl PaneSetup {
             ContentKind::CandlestickChart | ContentKind::ComparisonChart => {
                 Some(current_basis.unwrap_or(Basis::Time(Timeframe::M15)))
             }
-            ContentKind::Starter | ContentKind::TimeAndSales => None,
+            ContentKind::Starter | ContentKind::TimeAndSales | ContentKind::News => None,
         };
 
         let tick_multiplier = match content_kind {
@@ -284,6 +291,7 @@ impl PaneSetup {
             ContentKind::CandlestickChart
             | ContentKind::ComparisonChart
             | ContentKind::TimeAndSales
+            | ContentKind::News
             | ContentKind::Starter => current_tick_multiplier,
         };
 

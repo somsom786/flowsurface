@@ -36,7 +36,7 @@ use iced::{
     },
 };
 use iced_futures::futures::TryFutureExt;
-use std::{collections::HashMap, path::PathBuf, time::Instant, vec};
+use std::{collections::HashMap, path::PathBuf, time::Instant, vec, str::FromStr};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -48,7 +48,7 @@ pub enum Message {
     DistributeFetchedData {
         layout_id: uuid::Uuid,
         pane_id: uuid::Uuid,
-        stream: StreamKind,
+        stream: Option<StreamKind>,
         data: FetchedData,
     },
     ResolveStreams(uuid::Uuid, Vec<PersistStreamKind>),
@@ -60,6 +60,7 @@ pub struct Dashboard {
     pub popout: HashMap<window::Id, (pane_grid::State<pane::State>, WindowSpec)>,
     pub streams: UniqueStreams,
     layout_id: uuid::Uuid,
+    pub tree_api_key: Option<String>,
 }
 
 impl Default for Dashboard {
@@ -70,6 +71,7 @@ impl Default for Dashboard {
             streams: UniqueStreams::default(),
             popout: HashMap::new(),
             layout_id: uuid::Uuid::new_v4(),
+            tree_api_key: None,
         }
     }
 }
@@ -80,8 +82,8 @@ pub enum Event {
     DistributeFetchedData {
         layout_id: uuid::Uuid,
         pane_id: uuid::Uuid,
+        stream: Option<StreamKind>,
         data: FetchedData,
-        stream: StreamKind,
     },
     ResolveStreams {
         pane_id: uuid::Uuid,
@@ -136,6 +138,7 @@ impl Dashboard {
             streams: UniqueStreams::default(),
             popout,
             layout_id,
+            tree_api_key: None,
         }
     }
 
@@ -169,7 +172,35 @@ impl Dashboard {
             self.popout.insert(window, (pane, specs));
         }
 
-        Task::batch(open_popouts_tasks).chain(self.refresh_streams(main_window))
+        // Trigger news fetch for any News panes
+        let layout_id = self.layout_id;
+        let api_key = self.tree_api_key.clone();
+        let news_fetch_tasks: Vec<Task<Message>> = self
+            .iter_all_panes(main_window)
+            .filter_map(|(_, _, state)| {
+                if matches!(state.content, pane::Content::News(_)) {
+                    Some(news_fetch_task(layout_id, state.unique_id(), None, api_key.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Task::batch(open_popouts_tasks)
+            .chain(Task::batch(news_fetch_tasks))
+            .chain(self.refresh_streams(main_window))
+    }
+
+    pub fn process_news_event(&mut self, event: exchange::adapter::treeofalpha::Event) {
+        for (_, state) in self.panes.iter_mut() {
+            let _ = state.update(pane::Event::NewsEvent(event.clone()));
+        }
+
+        for (_, (panes, _)) in self.popout.iter_mut() {
+            for (_, state) in panes.iter_mut() {
+                let _ = state.update(pane::Event::NewsEvent(event.clone()));
+            }
+        }
     }
 
     pub fn update(
@@ -354,6 +385,7 @@ impl Dashboard {
                     return (self.merge_pane(main_window), None);
                 }
                 pane::Message::PaneEvent(pane, local) => {
+                    let api_key = self.tree_api_key.clone();
                     if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
                         let Some(effect) = state.update(local) else {
                             return (Task::none(), None);
@@ -361,17 +393,22 @@ impl Dashboard {
 
                         let task = match effect {
                             pane::Effect::RefreshStreams => self.refresh_streams(main_window.id),
-                            pane::Effect::RequestFetch(reqs) => request_fetch_many(
-                                state,
-                                *layout_id,
-                                reqs.into_iter().map(|r| (r.req_id, r.fetch, r.stream)),
-                            )
-                            .chain(self.refresh_streams(main_window.id)),
+                            pane::Effect::RequestFetch(reqs) => {
+                                request_fetch_many(
+                                    state,
+                                    *layout_id,
+                                    reqs.into_iter().map(|r| (r.req_id, r.fetch, r.stream)),
+                                    api_key,
+                                ).chain(self.refresh_streams(main_window.id))
+                            }
                             pane::Effect::SwitchTickersInGroup(ticker_info) => {
                                 self.switch_tickers_in_group(main_window.id, ticker_info)
                             }
                             pane::Effect::FocusWidget(id) => {
                                 return (iced::widget::operation::focus(id), None);
+                            }
+                            pane::Effect::OpenPopout { exchange, symbol } => {
+                                return (self.open_new_chart_window(main_window.position, exchange, symbol), None);
                             }
                         };
                         return (task, None);
@@ -492,6 +529,47 @@ impl Dashboard {
         }
 
         Task::none()
+    }
+
+    pub fn open_new_chart_window(&mut self, main_window_pos: Option<iced::Point>, exchange: String, symbol: String) -> Task<Message> {
+        let (window, task) = window::open(window::Settings {
+            position: main_window_pos
+                .map(|point| window::Position::Specific(point + Vector::new(40.0, 40.0)))
+                .unwrap_or_default(),
+            exit_on_close_request: false,
+            min_size: Some(iced::Size::new(400.0, 300.0)),
+            ..window::settings()
+        });
+
+        // Try to parse exchange, default to BinanceFutures if unknown
+        let ex = Exchange::from_str(&exchange).unwrap_or(Exchange::BinanceLinear);
+        
+        // Construct Ticker (assuming LinearPerps for consistency with News items usually)
+        let ticker = exchange::Ticker::new(&symbol, ex);
+        
+        // Construct TickerInfo with default values (fetched data will update later hopefully, or serve as placeholder)
+        let ticker_info = TickerInfo::new(ticker, 0.0001f32, 1.0f32, None);
+
+        let mut pane_state = pane::State::new();
+        let streams = pane_state.set_content_and_streams(vec![ticker_info], ContentKind::CandlestickChart);
+        self.streams.extend(streams.iter());
+        
+        let pane_id = pane_state.unique_id();
+        let (state, id) = pane_grid::State::new(pane_state);
+        self.popout.insert(window, (state, WindowSpec::default()));
+
+        // Trigger fetch
+        let mut fetch_tasks = Vec::new();
+        for stream in &streams {
+            if let StreamKind::Kline { .. } = stream {
+                fetch_tasks.push(kline_fetch_task(self.layout_id, pane_id, *stream, None, None));
+            }
+        }
+
+        // Chain task: window open -> pane clicked -> fetch
+        task.then(move |window| {
+            Task::done(Message::Pane(window, pane::Message::PaneClicked(id)))
+        }).chain(Task::batch(fetch_tasks))
     }
 
     fn merge_pane(&mut self, main_window: &Window) -> Task<Message> {
@@ -813,7 +891,7 @@ impl Dashboard {
         main_window: window::Id,
         pane_id: uuid::Uuid,
         data: FetchedData,
-        stream_type: StreamKind,
+        stream_type: Option<StreamKind>,
     ) -> Task<Message> {
         match data {
             FetchedData::Trades { batch, until_time } => {
@@ -843,10 +921,10 @@ impl Dashboard {
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
                     pane_state.status = pane::Status::Ready;
 
-                    if let StreamKind::Kline {
+                    if let Some(StreamKind::Kline {
                         timeframe,
                         ticker_info,
-                    } = stream_type
+                    }) = stream_type
                     {
                         pane_state.insert_hist_klines(req_id, timeframe, ticker_info, &data);
                     }
@@ -856,9 +934,15 @@ impl Dashboard {
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
                     pane_state.status = pane::Status::Ready;
 
-                    if let StreamKind::Kline { .. } = stream_type {
+                    if let Some(StreamKind::Kline { .. }) = stream_type {
                         pane_state.insert_hist_oi(req_id, &data);
                     }
+                }
+            }
+            FetchedData::News { data, req_id: _ } => {
+                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
+                    pane_state.status = pane::Status::Ready;
+                    pane_state.insert_news_history(data);
                 }
             }
         }
@@ -1005,6 +1089,7 @@ impl Dashboard {
     pub fn tick(&mut self, now: Instant, main_window: window::Id) -> Task<Message> {
         let mut tasks = vec![];
         let layout_id = self.layout_id;
+        let api_key = self.tree_api_key.clone();
 
         self.iter_all_panes_mut(main_window)
             .for_each(|(_window_id, _pane, state)| match state.tick(now) {
@@ -1018,6 +1103,7 @@ impl Dashboard {
                             state,
                             layout_id,
                             reqs.into_iter().map(|r| (r.req_id, r.fetch, r.stream)),
+                            api_key.clone(),
                         ));
                     }
                 },
@@ -1113,6 +1199,7 @@ fn request_fetch(
     req_id: uuid::Uuid,
     fetch: FetchRange,
     stream: Option<StreamKind>,
+    api_key: Option<String>,
 ) -> Task<Message> {
     let pane_id = state.unique_id();
 
@@ -1142,6 +1229,7 @@ fn request_fetch(
                 );
             }
         }
+        FetchRange::News => return news_fetch_task(layout_id, pane_id, Some(req_id), api_key),
         FetchRange::OpenInterest(from, to) => {
             let kline_stream = {
                 if let Some(s) = stream {
@@ -1190,7 +1278,7 @@ fn request_fetch(
                                 layout_id,
                                 pane_id,
                                 data,
-                                stream,
+                                stream: Some(stream),
                             }
                         },
                         move |result| match result {
@@ -1222,10 +1310,11 @@ fn request_fetch_many(
     state: &mut pane::State,
     layout_id: uuid::Uuid,
     reqs: impl IntoIterator<Item = (uuid::Uuid, FetchRange, Option<StreamKind>)>,
+    api_key: Option<String>,
 ) -> Task<Message> {
     let tasks = reqs
         .into_iter()
-        .map(|(req_id, fetch, stream)| request_fetch(state, layout_id, req_id, fetch, stream))
+        .map(|(req_id, fetch, stream)| request_fetch(state, layout_id, req_id, fetch, stream, api_key.clone()))
         .collect::<Vec<_>>();
     Task::batch(tasks)
 }
@@ -1256,7 +1345,7 @@ fn oi_fetch_task(
                         layout_id,
                         pane_id,
                         data,
-                        stream,
+                        stream: Some(stream),
                     }
                 }
                 Err(err) => Message::ErrorOccurred(Some(pane_id), DashboardError::Fetch(err)),
@@ -1297,7 +1386,7 @@ fn kline_fetch_task(
                         layout_id,
                         pane_id,
                         data,
-                        stream,
+                        stream: Some(stream),
                     }
                 }
                 Err(err) => {
@@ -1307,6 +1396,42 @@ fn kline_fetch_task(
         ),
         _ => Task::none(),
     };
+
+    update_status.chain(fetch_task)
+}
+
+fn news_fetch_task(
+    layout_id: uuid::Uuid,
+    pane_id: uuid::Uuid,
+    req_id: Option<uuid::Uuid>,
+    api_key: Option<String>,
+) -> Task<Message> {
+    let update_status = Task::done(Message::ChangePaneStatus(
+        pane_id,
+        pane::Status::Loading(exchange::fetcher::InfoKind::FetchingNews),
+    ));
+
+    let fetch_task = Task::perform(
+        adapter::treeofalpha::fetch_news(50, api_key)
+            .map_err(|err| err.to_user_message().to_string()),
+        move |result| match result {
+            Ok(news) => {
+                let data = FetchedData::News {
+                    data: news,
+                    req_id,
+                };
+                Message::DistributeFetchedData {
+                    layout_id,
+                    pane_id,
+                    data,
+                    stream: None,
+                }
+            }
+            Err(err) => {
+                Message::ErrorOccurred(Some(pane_id), DashboardError::Fetch(err))
+            }
+        },
+    );
 
     update_status.chain(fetch_task)
 }

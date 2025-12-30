@@ -1,5 +1,5 @@
 use crate::modal::layout_manager::LayoutManager;
-use crate::screen::dashboard::{Dashboard, pane};
+use crate::screen::dashboard::{Dashboard, pane, panel};
 use data::{
     UserTimezone,
     layout::{WindowSpec, pane::Axis},
@@ -30,6 +30,7 @@ pub struct SavedState {
     pub custom_theme: Option<data::Theme>,
     pub audio_cfg: data::AudioStream,
     pub volume_size_unit: exchange::SizeUnit,
+    pub tree_api_key: Option<String>,
 }
 
 impl SavedState {
@@ -58,6 +59,7 @@ impl Default for SavedState {
             custom_theme: None,
             audio_cfg: data::AudioStream::default(),
             volume_size_unit: exchange::SizeUnit::Base,
+            tree_api_key: None,
         }
     }
 }
@@ -167,6 +169,9 @@ impl From<&pane::State> for data::Pane {
                     link_group: pane.link_group,
                 }
             }
+            pane::Content::News(_) => data::Pane::News {
+                link_group: pane.link_group,
+            },
         }
     }
 }
@@ -274,6 +279,12 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
                 link_group,
             ))
         }
+        data::Pane::News { link_group } => Configuration::Pane(pane::State::from_config(
+            pane::Content::News(Some(panel::news::NewsPanel::new())),
+            vec![],
+            data::layout::pane::Settings::default(),
+            link_group,
+        )),
     }
 }
 
@@ -340,6 +351,7 @@ pub fn load_saved_state() -> SavedState {
                 scale_factor: state.scale_factor,
                 audio_cfg: state.audio_cfg,
                 volume_size_unit: state.size_in_quote_ccy,
+                tree_api_key: state.tree_of_alpha_api_key,
             }
         }
         Err(e) => {

@@ -1,4 +1,5 @@
 pub mod ladder;
+pub mod news;
 pub mod timeandsales;
 
 use iced::{

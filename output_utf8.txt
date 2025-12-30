@@ -1,0 +1,9 @@
+﻿    Checking flowsurface v0.8.6 (C:\Users\raynh\.gemini\antigravity\playground\news-surface)
+error[E0599]: no variant or associated item named `News` found for enum `flowsurface_exchange::adapter::treeofalpha::Event` in the current scope
+    --> src\screen\dashboard\pane.rs:1050:35
+     |
+1050 |                         TOAEvent::News(item) => panel.add_news(item),
+     |                                   ^^^^ variant or associated item not found in `flowsurface_exchange::adapter::treeofalpha::Event`
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `flowsurface` (bin "flowsurface") due to 1 previous error

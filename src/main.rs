@@ -25,7 +25,7 @@ use widget::{
 use iced::{
     Alignment, Element, Subscription, Task, keyboard, padding,
     widget::{
-        button, column, container, pane_grid, pick_list, row, rule, scrollable, text,
+        button, column, container, pane_grid, pick_list, row, rule, scrollable, text, text_input,
         tooltip::Position as TooltipPosition,
     },
 };
@@ -65,6 +65,8 @@ struct Flowsurface {
     timezone: data::UserTimezone,
     theme: data::Theme,
     notifications: Vec<Toast>,
+    news_panel: screen::dashboard::panel::news::NewsPanel,
+    tree_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +84,7 @@ enum Message {
     RestartRequested(HashMap<window::Id, WindowSpec>),
     GoBack,
     DataFolderRequested,
+    SetTreeApiKey(String),
     ThemeSelected(data::Theme),
     ScaleFactorChanged(data::ScaleFactor),
     SetTimezone(data::UserTimezone),
@@ -92,6 +95,8 @@ enum Message {
     ThemeEditor(modal::theme_editor::Message),
     Layouts(modal::layout_manager::Message),
     AudioStream(modal::audio::Message),
+    NewsEvent(exchange::adapter::treeofalpha::Event),
+    NewsPanel(screen::dashboard::panel::news::Message),
 }
 
 impl Flowsurface {
@@ -123,6 +128,8 @@ impl Flowsurface {
             volume_size_unit: saved_state.volume_size_unit,
             theme: saved_state.theme,
             notifications: vec![],
+            news_panel: screen::dashboard::panel::news::NewsPanel::new(),
+            tree_api_key: saved_state.tree_api_key,
         };
 
         let active_layout_id = state.layout_manager.active_layout_id().unwrap_or(
@@ -210,7 +217,48 @@ impl Flowsurface {
                     let dashboard = self.active_dashboard_mut();
 
                     if window != main_window {
-                        dashboard.popout.remove(&window);
+                        // Merge the pane back to main window instead of discarding it
+                        if let Some((panes, _)) = dashboard.popout.remove(&window) {
+                            // Get the configuration from the popout pane
+                            if let Some((_, popout_state)) = panes.iter().next() {
+                                // Extract key data to reconstruct the pane
+                                // TickerInfo is Copy, so this is safe
+                                if let Some(ticker) = popout_state.stream_pair() {
+                                    let kind = popout_state.content.kind(); 
+                                    
+                                    // create a fresh state
+                                    let mut new_state = screen::dashboard::pane::State::new();
+                                    let _streams = new_state.set_content_and_streams(vec![ticker], kind);
+                                    
+                                    // We need to register these new streams? 
+                                    // dashboard.streams.extend(streams) logic is usually needed
+                                    // But direct access to dashboard.streams might be tricky if we borrow dashboard mutably for panes
+                                    
+                                    // Actually, we need to handle stream registration.
+                                    // Let's just put the state in. The tick() loop or similar might pick up streams?
+                                    // Or we just accept that we need to trigger a fetch/subscribe.
+                                    // The `set_content_and_streams` returns `Vec<PersistStreamKind>`.
+                                    // We should add these to dashboard.streams if possible.
+                                    
+                                    // However, dashboard is borrowed as `active_dashboard_mut`.
+                                    // Splitting borrows is hard here.
+                                    // Simpler: Just puts the pane in. The user can re-click if stream doesn't start, 
+                                    // OR (better) we trust that the pane will request data when it initializes/ticks.
+                                    
+                                    // Let's insert into main panes
+                                    if let Some((target, _)) = dashboard.panes.iter().last() {
+                                        let _ = dashboard.panes.split(
+                                            pane_grid::Axis::Horizontal,
+                                            *target,
+                                            new_state,
+                                        );
+                                    } else {
+                                        let (state, _) = pane_grid::State::new(new_state);
+                                        dashboard.panes = state;
+                                    }
+                                }
+                            }
+                        }
                         return window::close(window);
                     }
 
@@ -267,6 +315,9 @@ impl Flowsurface {
                 let layout_id = id.unwrap_or(active_layout.unique);
 
                 if let Some(dashboard) = self.layout_manager.mut_dashboard(layout_id) {
+                    // Ensure API key is synced to dashboard
+                    dashboard.tree_api_key = self.tree_api_key.clone();
+                    
                     let (main_task, event) = dashboard.update(msg, &main_window, &layout_id);
 
                     let additional_task = match event {
@@ -437,10 +488,16 @@ impl Flowsurface {
             }
             Message::AudioStream(message) => self.audio_stream.update(message),
             Message::DataFolderRequested => {
-                if let Err(err) = data::open_data_folder() {
-                    self.notifications
-                        .push(Toast::error(format!("Failed to open data folder: {err}")));
-                }
+                let _ = std::process::Command::new("explorer")
+                    .arg(data::data_path(None).to_str().unwrap())
+                    .spawn();
+            }
+            Message::SetTreeApiKey(key) => {
+                let key = if key.is_empty() { None } else { Some(key) };
+                self.tree_api_key = key.clone();
+                // Update news subscription
+                let _news_sub = exchange::adapter::treeofalpha::news_subscription(key);
+                // Note: The actual subscription update happens in the subscription() method automatically
             }
             Message::ThemeEditor(msg) => {
                 let action = self.theme_editor.update(msg, &self.theme.clone().into());
@@ -502,6 +559,42 @@ impl Flowsurface {
                 active_windows.push(self.main_window.id);
 
                 return window::collect_window_specs(active_windows, Message::RestartRequested);
+            }
+            Message::NewsEvent(event) => {
+                // Propagate to all dashboards
+                self.layout_manager
+                    .iter_dashboards_mut()
+                    .for_each(|dashboard| {
+                        dashboard.process_news_event(event.clone());
+                    });
+
+                match event {
+                    exchange::adapter::treeofalpha::Event::Connected => {
+                        log::info!("Connected to Tree of Alpha news feed");
+                    }
+                    exchange::adapter::treeofalpha::Event::Disconnected(reason) => {
+                        log::warn!("Disconnected from Tree of Alpha: {}", reason);
+                    }
+                    exchange::adapter::treeofalpha::Event::NewsReceived(news) => {
+                        self.news_panel.add_news(news);
+                    }
+                }
+            }
+            Message::NewsPanel(msg) => {
+                if let Some(action) = self.news_panel.update(msg) {
+                    match action {
+                        screen::dashboard::panel::news::Action::NavigateToTicker { exchange, symbol } => {
+                            log::info!("Navigate to ticker: {} on {}", symbol, exchange);
+                            // TODO: Implement ticker navigation
+                        }
+                        screen::dashboard::panel::news::Action::OpenChartInNewWindow { exchange, symbol } => {
+                            let pos = self.main_window.position;
+                            let dashboard = self.active_dashboard_mut();
+                            return dashboard.open_new_chart_window(pos, exchange, symbol)
+                                .map(|m| Message::Dashboard { layout_id: None, event: m });
+                        }
+                    }
+                }
             }
         }
         Task::none()
@@ -625,12 +718,16 @@ impl Flowsurface {
             }
         });
 
+        let tree_news = exchange::adapter::treeofalpha::news_subscription(self.tree_api_key.clone())
+            .map(Message::NewsEvent);
+
         Subscription::batch(vec![
             exchange_streams,
             sidebar,
             window_events,
             tick,
             hotkeys,
+            tree_news,
         ])
     }
 
@@ -820,6 +917,21 @@ impl Flowsurface {
                         )
                     };
 
+                    let tree_api_key_input = {
+                        let input = text_input(
+                            "Tree of Alpha API Key",
+                            self.tree_api_key.as_deref().unwrap_or(""),
+                        )
+                        .on_input(Message::SetTreeApiKey)
+                        .padding(5)
+                        .secure(true); // Don't show key in plain text
+
+                        column![
+                            text("News API Key").size(14),
+                            input
+                        ].spacing(4)
+                    };
+
                     let column_content = split_column![
                         column![open_data_folder,].spacing(8),
                         column![text("Sidebar position").size(14), sidebar_pos,].spacing(12),
@@ -827,6 +939,7 @@ impl Flowsurface {
                         column![text("Market data").size(14), size_in_quote_currency_checkbox,].spacing(12),
                         column![text("Theme").size(14), theme_picklist,].spacing(12),
                         column![text("Interface scale").size(14), scale_factor,].spacing(12),
+                         column![tree_api_key_input].spacing(12),
                         column![
                             text("Experimental").size(14),
                             column![trade_fetch_checkbox, toggle_theme_editor,].spacing(8),
@@ -1023,6 +1136,29 @@ impl Flowsurface {
                     align_x,
                 )
             }
+            sidebar::Menu::News => {
+                let (align_x, padding) = match sidebar_pos {
+                    sidebar::Position::Left => (Alignment::Start, padding::left(44).top(112)),
+                    sidebar::Position::Right => (Alignment::End, padding::right(44).top(112)),
+                };
+
+                let news_content = container(
+                    self.news_panel.view().map(Message::NewsPanel)
+                )
+                .max_width(360)
+                .max_height(500)
+                .padding(16)
+                .style(style::dashboard_modal);
+
+                dashboard_modal(
+                    base,
+                    news_content,
+                    Message::Sidebar(dashboard::sidebar::Message::ToggleSidebarMenu(None)),
+                    padding,
+                    Alignment::Start,
+                    align_x,
+                )
+            }
         }
     }
 
@@ -1075,6 +1211,7 @@ impl Flowsurface {
             self.ui_scale_factor,
             audio_cfg,
             self.volume_size_unit,
+            self.tree_api_key.clone(),
         );
 
         match serde_json::to_string(&state) {

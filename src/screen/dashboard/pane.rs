@@ -10,7 +10,7 @@ use crate::{
         },
     },
     screen::dashboard::{
-        panel::{self, ladder::Ladder, timeandsales::TimeAndSales},
+        panel::{self, ladder::Ladder, news::NewsPanel, timeandsales::TimeAndSales},
         tickers_table::TickersTable,
     },
     style::{self, Icon, icon_text},
@@ -44,6 +44,7 @@ pub enum Effect {
     RequestFetch(FetchRequests),
     SwitchTickersInGroup(TickerInfo),
     FocusWidget(iced::widget::Id),
+    OpenPopout { exchange: String, symbol: String },
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -94,6 +95,9 @@ pub enum Event {
     StreamModifierChanged(modal::stream::Message),
     ComparisonChartInteraction(super::chart::comparison::Message),
     MiniTickersListInteraction(modal::pane::mini_tickers_list::Message),
+
+    NewsEvent(exchange::adapter::treeofalpha::Event),
+    NewsPanelInteraction(panel::news::Message),
 }
 
 pub struct State {
@@ -150,6 +154,14 @@ impl State {
             1 => Some(StreamPairKind::SingleSource(unique[0])),
             _ => Some(StreamPairKind::MultiSource(unique)),
         }
+    }
+
+    pub fn insert_news_history(&mut self, news: Vec<exchange::adapter::treeofalpha::NewsItem>) {
+         if let Content::News(Some(panel)) = &mut self.content {
+             for item in news.into_iter().rev() {
+                 panel.add_news(item);
+             }
+         }
     }
 
     pub fn set_content_and_streams(
@@ -310,6 +322,12 @@ impl State {
                     );
 
                     (content, streams)
+                }
+
+                ContentKind::News => {
+                    let content = Content::News(Some(NewsPanel::new()));
+                    // News stream is global, no specific stream needed here
+                    (content, vec![])
                 }
                 ContentKind::Starter => unreachable!(),
             }
@@ -680,6 +698,43 @@ impl State {
                     )
                 }
             }
+
+            Content::News(panel) => {
+                if let Some(panel) = panel {
+                    let base = panel.view().map(move |message| {
+                        Message::PaneEvent(id, Event::NewsPanelInteraction(message))
+                    });
+
+                    self.compose_stack_view(
+                        base,
+                        id,
+                        None,
+                        compact_controls,
+                        || column![].into(),
+                        None,
+                        tickers_table,
+                    )
+                } else {
+                    // News pane doesn't require a ticker - show loading state
+                    let loading_content = column![
+                        text("News").size(16),
+                        text("Loading news...").size(14)
+                    ]
+                    .spacing(8)
+                    .align_x(Alignment::Center);
+
+                    let base = center(loading_content).into();
+                    self.compose_stack_view(
+                        base,
+                        id,
+                        None,
+                        compact_controls,
+                        || column![].into(),
+                        None,
+                        tickers_table,
+                    )
+                }
+            }
             Content::Heatmap {
                 chart, indicators, ..
             } => {
@@ -872,6 +927,9 @@ impl State {
             Status::Loading(exchange::fetcher::InfoKind::FetchingOI) => {
                 stream_info_element = stream_info_element.push(text("Fetching Open Interest..."));
             }
+            Status::Loading(exchange::fetcher::InfoKind::FetchingNews) => {
+                stream_info_element = stream_info_element.push(text("Fetching News..."));
+            }
             Status::Stale(msg) => {
                 stream_info_element = stream_info_element.push(text(msg));
             }
@@ -934,6 +992,19 @@ impl State {
                 self.modal = None;
             }
             Event::ContentSelected(kind) => {
+                if matches!(kind, ContentKind::News) {
+                    self.content = Content::News(Some(NewsPanel::new()));
+                    self.streams = ResolvedStream::Ready(vec![]);
+                    
+                    let req_id = uuid::Uuid::new_v4();
+                    let spec = exchange::fetcher::FetchSpec {
+                        req_id,
+                        fetch: exchange::fetcher::FetchRange::News,
+                        stream: None,
+                    };
+                    return Some(Effect::RequestFetch(std::iter::once(spec).collect()));
+                }
+
                 self.content = Content::placeholder(kind);
 
                 if !matches!(kind, ContentKind::Starter) {
@@ -998,14 +1069,35 @@ impl State {
                     }
                 }
                 modal::pane::settings::study::StudyMessage::Heatmap(m) => {
-                    if let Content::Heatmap { chart, studies, .. } = &mut self.content
+                    if let Content::Heatmap { chart, .. } = &mut self.content
                         && let Some(c) = chart
                     {
                         c.update_study_configurator(m);
-                        *studies = c.studies.clone();
                     }
                 }
             },
+            Event::NewsEvent(event) => {
+                if let Content::News(Some(panel)) = &mut self.content {
+                    use exchange::adapter::treeofalpha::Event as TOAEvent;
+                    match event {
+                        TOAEvent::NewsReceived(item) => panel.add_news(item),
+                        _ => {}
+                    }
+                }
+            }
+            Event::NewsPanelInteraction(msg) => {
+                if let Content::News(Some(panel)) = &mut self.content {
+                    if let Some(action) = panel.update(msg) {
+                        if let panel::news::Action::NavigateToTicker { exchange, symbol } = &action {
+                            log::info!("Navigate to ticker: {} {}", exchange, symbol);
+                        }
+                        if let panel::news::Action::OpenChartInNewWindow { exchange, symbol } = action {
+                            return Some(Effect::OpenPopout { exchange, symbol });
+                        }
+                    }
+                }
+            }
+
             Event::StreamModifierChanged(message) => {
                 if let Some(Modal::StreamModifier(mut modifier)) = self.modal.take() {
                     let mut effect: Option<Effect> = None;
@@ -1287,6 +1379,23 @@ impl State {
 
         let show_modal = |modal: Modal| Message::PaneEvent(pane, Event::ShowModal(modal));
 
+        // Content type picker - allows switching pane type (e.g., to Heatmap)
+        if !treat_as_starter {
+            let current_kind = self.content.kind();
+            let content_picker = pick_list(
+                ContentKind::ALL.iter()
+                    .filter(|k| **k != ContentKind::Starter)
+                    .copied()
+                    .collect::<Vec<_>>(),
+                Some(current_kind),
+                move |kind| Message::PaneEvent(pane, Event::ContentSelected(kind)),
+            )
+            .text_size(11)
+            .padding([2, 8]);
+            
+            buttons = buttons.push(content_picker);
+        }
+
         if !treat_as_starter {
             buttons = buttons.push(button_with_tooltip(
                 icon_text(Icon::Cog, 12),
@@ -1493,7 +1602,7 @@ impl State {
             Content::Ladder(panel) => panel
                 .as_mut()
                 .and_then(|p| p.invalidate(Some(now)).map(Action::Panel)),
-            Content::Starter => None,
+            Content::Starter | Content::News(_) => None,
             Content::Comparison(chart) => chart
                 .as_mut()
                 .and_then(|c| c.invalidate(Some(now)).map(Action::Chart)),
@@ -1511,7 +1620,7 @@ impl State {
                 }
             }
             Content::Ladder(_) | Content::TimeAndSales(_) => Some(100),
-            Content::Starter => None,
+            Content::Starter | Content::News(_) => None,
         }
     }
 
@@ -1591,6 +1700,7 @@ pub enum Content {
     },
     TimeAndSales(Option<TimeAndSales>),
     Ladder(Option<Ladder>),
+    News(Option<NewsPanel>),
     Comparison(Option<ComparisonChart>),
 }
 
@@ -1790,6 +1900,7 @@ impl Content {
             ContentKind::ComparisonChart => Content::Comparison(None),
             ContentKind::TimeAndSales => Content::TimeAndSales(None),
             ContentKind::Ladder => Content::Ladder(None),
+            ContentKind::News => Content::News(None),
         }
     }
 
@@ -1800,7 +1911,7 @@ impl Content {
             Content::TimeAndSales(panel) => Some(panel.as_ref()?.last_update()),
             Content::Ladder(panel) => Some(panel.as_ref()?.last_update()),
             Content::Comparison(chart) => Some(chart.as_ref()?.last_update()),
-            Content::Starter => None,
+            Content::Starter | Content::News(_) => None,
         }
     }
 
@@ -1858,7 +1969,8 @@ impl Content {
             Content::TimeAndSales(_)
             | Content::Ladder(_)
             | Content::Starter
-            | Content::Comparison(_) => {
+            | Content::Comparison(_)
+            | Content::News(_) => {
                 panic!("indicator reorder on {} pane", self)
             }
         }
@@ -1895,6 +2007,7 @@ impl Content {
             Content::TimeAndSales(_)
             | Content::Ladder(_)
             | Content::Starter
+            | Content::News(_)
             | Content::Comparison(_) => None,
         }
     }
@@ -1941,6 +2054,7 @@ impl Content {
             Content::TimeAndSales(_) => ContentKind::TimeAndSales,
             Content::Ladder(_) => ContentKind::Ladder,
             Content::Comparison(_) => ContentKind::ComparisonChart,
+            Content::News(_) => ContentKind::News,
             Content::Starter => ContentKind::Starter,
         }
     }
@@ -1949,9 +2063,10 @@ impl Content {
         match self {
             Content::Heatmap { chart, .. } => chart.is_some(),
             Content::Kline { chart, .. } => chart.is_some(),
-            Content::TimeAndSales(panel) => panel.is_some(),
-            Content::Ladder(panel) => panel.is_some(),
-            Content::Comparison(chart) => chart.is_some(),
+            Content::TimeAndSales(c) => c.is_some(),
+            Content::Ladder(c) => c.is_some(),
+            Content::Comparison(c) => c.is_some(),
+            Content::News(c) => c.is_some(),
             Content::Starter => true,
         }
     }

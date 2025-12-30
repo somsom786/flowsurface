@@ -13,6 +13,7 @@ pub mod binance;
 pub mod bybit;
 pub mod hyperliquid;
 pub mod okex;
+pub mod treeofalpha;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedStream {
